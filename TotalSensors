@@ -1,0 +1,361 @@
+#include <SoftwareSerial.h>
+#include <DHT.h>
+#include "PMS.h"
+
+#define NODE_ADDRESS 2
+#define TARGET_NODE_ADDRESS 1
+
+#define DHTPIN A0
+#define DHTTYPE DHT22
+#define MAXLENGTHCH2O 9
+#define VREF 5.0  // voltage on AREF pin
+#define WIND_DIRECTION_RX_PIN 2
+#define WIND_DIRECTION_TX_PIN 3
+#define WIND_DIRECTION_RE_PIN 5
+#define WIND_DIRECTION_DE_PIN 4
+#define WIND_SPEED_RX_PIN 6
+#define WIND_SPEED_TX_PIN 7
+#define WIND_SPEED_RE_PIN 9
+#define WIND_SPEED_DE_PIN 8
+
+DHT dht(DHTPIN, DHTTYPE);
+
+byte receivedCommandStack[MAXLENGTHCH2O];
+boolean receivedFlag;
+float ch2o = 0;
+String ch2oStr;
+
+// LORA
+int loraContentLength;
+
+unsigned long receive_time = 0;
+
+int flagHT;
+int flagPM;
+int flagWINDSPEED;
+int flagWINDDIRECTION;
+int flagCH2O;
+int flagLORA;
+
+
+String humidityStr;
+String temperatureStr;
+String pm_1_0Str;
+String pm_2_5Str;
+String pm_10_0Str;
+String loraContentLengthStr;
+String loraContent;
+String windSpeedStr;
+String windDirectionStr;
+
+int timeIntervalHT = 10;
+int timeIntervalPM = 50;
+int timeIntervalWINDSPEED = 500;
+int timeIntervalWINDDIRECTION = 1000;
+int timeIntervalCH2O = 1200;
+int timeIntervalLORA = 1500;
+
+void setRS485Control(bool re, bool de, bool isSpeed = true) {
+  // Set RE and DE pins according to the mode (Send/Receive) and sensor type (Speed/Direction)
+  digitalWrite(isSpeed ? WIND_SPEED_RE_PIN : WIND_DIRECTION_RE_PIN, re);
+  digitalWrite(isSpeed ? WIND_SPEED_DE_PIN : WIND_DIRECTION_DE_PIN, de);
+}
+
+class WindSpeed {
+private:
+  SoftwareSerial windSpeedSerial;
+  int RE_PIN;
+  int DE_PIN;
+  byte requestWindSpeed[8];
+  byte windSpeedBuffer[8];  // Adjust size as per the expected response
+
+public:
+  WindSpeed(int rxPin, int txPin, int rePin, int dePin)
+    : windSpeedSerial(rxPin, txPin), RE_PIN(rePin), DE_PIN(dePin) {
+    // Replace with the request command for your specific anemometer
+    byte defaultRequestWindSpeed[8] = { 0x01, 0x03, 0x00, 0x00, 0x00, 0x01, 0x84, 0x0A };
+    memcpy(requestWindSpeed, defaultRequestWindSpeed, 8);
+  }
+
+  void begin(long baudRate) {
+    pinMode(RE_PIN, OUTPUT);
+    pinMode(DE_PIN, OUTPUT);
+    // Ensure RE and DE are low to listen for responses
+    digitalWrite(RE_PIN, LOW);
+    digitalWrite(DE_PIN, LOW);
+
+    windSpeedSerial.begin(baudRate);
+  }
+
+  void requestWindSpeedData() {
+    windSpeedSerial.listen();
+    setRS485Control(HIGH, HIGH, true);
+    windSpeedSerial.write(requestWindSpeed, sizeof(requestWindSpeed));
+    setRS485Control(LOW, LOW, true);
+    delay(200);
+
+    for (int i = 0; i < sizeof(windSpeedBuffer); i ++) {
+      windSpeedBuffer[i] = windSpeedSerial.read();
+    }
+    displayWindSpeed(sizeof(windSpeedBuffer));
+
+    delay(100);
+  }
+  
+
+
+  void displayWindSpeed(int size) {
+    float windSpeed = calculateWindSpeed(windSpeedBuffer[4]);
+    // Serial.print("Current wind speed: ");
+    // Serial.print(windSpeed);
+    // Serial.println("m/s");
+    windSpeedStr = String(windSpeed);
+    flagWINDSPEED = 1;
+  }
+
+    float calculateWindSpeed(int rawValue) {
+    // Convert the raw sensor value to wind speed in m/s
+    return rawValue / 10.0;
+  }
+
+};
+
+class WindDirection {
+private:
+  SoftwareSerial windDirSerial;
+  int RE_PIN;
+  int DE_PIN;
+  byte requestWindDir[8];
+  byte windDirBuffer[20];
+
+public:
+  WindDirection(int rxPin, int txPin, int rePin, int dePin)
+    : windDirSerial(rxPin, txPin), RE_PIN(rePin), DE_PIN(dePin) {
+    // Initialize request command for the wind direction sensor
+    byte defaultRequestCommand[8] = { 0x01, 0x03, 0x00, 0x00, 0x00, 0x02, 0xC4, 0x0B };
+    memcpy(requestWindDir, defaultRequestCommand, 8);
+  }
+
+  void begin(long baudRate) {
+    windDirSerial.begin(baudRate);
+    pinMode(RE_PIN, OUTPUT);
+    pinMode(DE_PIN, OUTPUT);
+  }
+
+  void readWindDirectionData() {
+    windDirSerial.listen();
+    setRS485Control(HIGH, HIGH, false);
+    windDirSerial.write(requestWindDir, sizeof(requestWindDir));
+    setRS485Control(LOW, LOW, false);
+    delay(200);
+
+    for (int i = 0; i < 11; i++) {
+      windDirBuffer[i] = windDirSerial.read();
+    }
+    displayWindDirection((windDirBuffer[5] * 256) + windDirBuffer[6]);
+
+  }
+
+  void displayWindDirection(int direction) {
+    Serial.print("Direction : ");
+    switch (direction) {
+      case 0: windDirectionStr = "N"; break;
+      case 45: windDirectionStr = "NE"; break;
+      case 90: windDirectionStr = "E"; break;
+      case 135: windDirectionStr = "SE"; break;
+      case 180: windDirectionStr = "S"; break;
+      case 225: windDirectionStr = "SW"; break;
+      case 270: windDirectionStr = "W"; break;
+      case 315: windDirectionStr= "NW"; break;
+      default: Serial.println(direction);  // Print raw value if not a cardinal direction
+    }
+    flagWINDDIRECTION = 1;
+  }
+};
+
+SoftwareSerial pmSerial(12, 13);
+SoftwareSerial ch2oSerial(10, 11);
+SoftwareSerial loraSerial(0, 1);
+WindSpeed windspeed(WIND_SPEED_RX_PIN, WIND_SPEED_TX_PIN, WIND_SPEED_RE_PIN, WIND_SPEED_DE_PIN);
+WindDirection winddirection(WIND_DIRECTION_RX_PIN, WIND_DIRECTION_TX_PIN, WIND_DIRECTION_RE_PIN, WIND_DIRECTION_DE_PIN);
+
+PMS pms(pmSerial);
+PMS::DATA data;
+
+
+void setup() {
+  Serial.begin(9600);
+  dht.begin();
+  pmSerial.begin(9600);
+  windspeed.begin(4800);
+  winddirection.begin(4800);
+  ch2oSerial.begin(9600);
+  loraSerial.begin(9600);
+  setRS485Control(LOW, LOW);
+}
+
+void loop() {
+  unsigned long gapTime = 500;  // 각 센서 처리 사이의 시간 텀
+
+  if ((millis() - receive_time) < timeIntervalHT) {
+    if (flagHT == 0) {
+      readAndSetHTStr();
+    }
+  }
+
+  // 첫 번째와 두 번째 센서 사이에 gapTime만큼의 텀 추가
+  else if (((millis() - receive_time) >= (timeIntervalHT + gapTime)) && ((millis() - receive_time) < (timeIntervalPM + gapTime))) {
+    if (flagPM == 0) {
+      readPM();
+    }
+  }
+
+  else if (((millis() - receive_time) >= (timeIntervalPM + gapTime)) && ((millis() - receive_time) < (timeIntervalWINDSPEED + gapTime))) {
+    if (flagWINDSPEED == 0) {
+      windspeed.requestWindSpeedData();
+    }
+  }
+
+  else if (((millis() - receive_time) >= (timeIntervalWINDSPEED + gapTime)) && ((millis() - receive_time) < (timeIntervalWINDDIRECTION + gapTime))) {
+    if (flagWINDDIRECTION == 0) {
+      winddirection.readWindDirectionData();
+    }
+  }
+
+  // 두 번째와 세 번째 센서 사이에 gapTime만큼의 텀 추가
+  else if (((millis() - receive_time) >= (timeIntervalWINDDIRECTION + gapTime)) && ((millis() - receive_time) < (timeIntervalCH2O + gapTime))) {
+    ch2oSerial.listen();
+    if (flagCH2O == 0) {
+      readAndSetCh2OStr();
+    }
+  }
+
+  // 세 번째와 네 번째 센서 사이에 gapTime만큼의 텀 추가
+  else if (((millis() - receive_time) >= (timeIntervalCH2O + gapTime)) && ((millis() - receive_time) < (timeIntervalLORA + gapTime))) {
+    loraSerial.listen();
+    if (flagLORA == 0) {
+      loraSend();
+    }
+  }
+
+  // 네 번째 센서 처리 후 다음 사이클 시작 전 gapTime만큼의 텀 추가
+  else if ((millis() - receive_time) >= (timeIntervalLORA + gapTime)) {
+    receive_time = millis();  // 다음 사이클 시작 시간 재설정
+    flagHT = 0;
+    flagPM = 0;
+    flagWINDSPEED = 0;
+    flagWINDDIRECTION = 0;
+    flagCH2O = 0;
+    flagLORA = 0;
+  }
+}
+
+
+void readAndSetHTStr() {
+  // 센서로부터 온도와 습도 읽기
+  int h = dht.readHumidity();
+  int t = dht.readTemperature();
+
+  // 값이 유효한지 체크
+  if (isnan(h) || isnan(t)) {
+    Serial.println("Can't read data from DTH22");
+    return;
+  }
+  humidityStr = String(h);
+  temperatureStr = String(t);
+
+  flagHT = 1;
+  return;
+}
+
+
+void readPM() {
+  pmSerial.listen();  // PMS 센서의 SoftwareSerial 포트를 활성화합니다.
+  if (pms.readUntil(data)) {
+    pm_1_0Str = String(data.PM_AE_UG_1_0);
+    pm_2_5Str = String(data.PM_AE_UG_2_5);
+    pm_10_0Str = String(data.PM_AE_UG_10_0);
+    flagPM = 1;
+  } else {
+    Serial.println("Pm error");
+    flagPM = 0;
+  }
+}
+
+void readAndSetCh2OStr() {
+  if (available1() == 1) {
+    float ppb = (unsigned int)(receivedCommandStack[4] * 256) + receivedCommandStack[5];  // bit 4: ppm high 8-bit; bit 5: ppm low 8-bit
+    float ppm = ppb / 1000;                                                               // 1ppb = 1000ppm
+
+    ch2oStr = String(ppm);
+    receivedFlag = 0;
+    flagCH2O = 1;
+  }
+  return;
+}
+
+byte checkSum_CH2O(byte array[], byte length) {
+  byte sum = 0;
+  for (int i = 1; i < length - 1; i++) {
+    sum += array[i];
+  }
+  sum = (~sum) + 1;
+  return sum;
+}
+
+boolean available1() {  //new data was recevied
+  while (ch2oSerial.available()) {
+    for (byte index = 0; index < MAXLENGTHCH2O - 1; index++) {
+      receivedCommandStack[index] = receivedCommandStack[index + 1];
+    }
+    receivedCommandStack[MAXLENGTHCH2O - 1] = ch2oSerial.read();
+
+    byte sumNum = checkSum_CH2O(receivedCommandStack, MAXLENGTHCH2O);
+    if ((receivedCommandStack[0] == 0xFF) && (receivedCommandStack[1] == 0x17) && (receivedCommandStack[2] == 0x04) && (receivedCommandStack[MAXLENGTHCH2O - 1] == sumNum)) {  //head bit and sum are all right
+      receivedFlag = 1;                                                                                                                                                        //new data received
+      // Serial.println("receivedFlag = 1");
+      return receivedFlag;
+    } else {
+      receivedFlag = 0;  //data loss or error
+      return receivedFlag;
+    }
+  }
+  return receivedFlag;
+}
+
+void loraSend() {
+  String sensorData = getSensorData();
+
+  loraContentLength = sensorData.length();
+  loraContentLength += 4;  // 노드번호-2, 패킷구별//-2
+
+  loraContent = "AT+SEND=";
+  loraContent += String(TARGET_NODE_ADDRESS);
+  loraContent += "," + String(loraContentLength) + ",";
+
+  loraContent += String(NODE_ADDRESS) + "/";
+  loraContent += sensorData + ";";
+
+  loraSerial.println(loraContent);
+  Serial.println(loraContent);
+
+  flagLORA = 1;
+  return;
+}
+
+String getSensorData() {
+  String data;
+
+  data = humidityStr + "/" + temperatureStr;
+  data += "/" + pm_1_0Str + "/" + pm_2_5Str + "/" + pm_10_0Str;
+  data += "/" + ch2oStr;
+  data += "/" + windSpeedStr;
+  data += "/" + windDirectionStr;
+
+  return data;
+}
+
+void printValue(String target, float value) {
+  Serial.print(target + ": ");
+  Serial.println(value);
+}
